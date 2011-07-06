@@ -26,6 +26,6 @@ setup(
 	"""
         [ckan.plugins]
 	# Add plugins here, eg
-	# drupal=ckanext.drupal:Drupal
+	drupal=ckanext.drupal.plugin:Drupal
 	""",
 )
