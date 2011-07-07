@@ -3,16 +3,62 @@ from sqlalchemy import types, Column, Table
 from sqlalchemy.sql import select
 from sqlalchemy import MetaData, create_engine
 import json
+import time
 
 from ckan.plugins import IConfigurer, ISession
 from ckan.plugins import implements, SingletonPlugin
 import ckan.model as model
+
 
 class Drupal(SingletonPlugin):
     '''initial test of plugin'''
     implements(IConfigurer)
     implements(ISession, inherit=True)
 
+    def create_node(self, row, session, conn):
+
+        timestamp=int(time.time())
+
+        result = conn.execute(
+            self.node_revisions.insert().values(
+                nid=0,
+                uid=1,
+                title=row.get('title',''),
+                body=row.get('description',''),
+                teaser=row.get('title',''),
+                log='%s-%s'%(session.revision.id,session.revision.message),
+                timestamp=timestamp,
+                format=1
+            )
+        )
+        vid = result.inserted_primary_key[0]
+        result = conn.execute(
+            self.node.insert().values(
+                vid=vid,
+                type='package',
+                language='',
+                title=row.get('title',''),
+                uid=1,
+                status=0,
+                created=timestamp,
+                changed=timestamp,
+                comment=2,
+                promote=0,
+                moderate=0,
+                sticky=0,
+                tnid=0,
+                transalate=0,
+            )
+        )
+        nid = result.inserted_primary_key[0]
+        conn.execute(
+            self.node_revisions.update().where(
+                self.node_revisions.c.vid == vid).values(
+                    nid=nid,
+                )
+        )
+        return nid
+            
     def update_drupal(self, session, conn):
 
         obj_cache = session._object_cache
@@ -31,13 +77,19 @@ class Drupal(SingletonPlugin):
         updates = []
         deletes = []
 
+        new_nids = []
+
         for obj in new:
             if hasattr(obj, 'state') and 'pending' in obj.state:
                 continue
             if isinstance(obj, (model.Package, model.PackageRevision)):
                 insert = self.add_insert(obj, self.package_table)
                 package_rows[insert['id']] = insert
+                nid = self.create_node(insert, session, conn)
+                new_nids.append(nid)
+                insert['nid'] = nid
                 inserts.append(insert)
+
             if isinstance(obj, (model.Resource, model.ResourceRevision)):
                 inserts.append(self.add_insert(obj, self.resource_table))
             if isinstance(obj, (model.PackageExtra, model.PackageExtraRevision)):
@@ -90,7 +142,13 @@ class Drupal(SingletonPlugin):
            id = row.pop('id')
            conn.execute(table.update().where(table.c.id==id).values(**row))
 
-
+        for nid in new_nids:
+            conn.execute(
+                self.node.update().where(
+                    self.node.c.nid == nid).values(
+                        status=1,
+                    )
+            )
 
     def add_insert(self, obj, table):
 
@@ -164,7 +222,7 @@ class Drupal(SingletonPlugin):
         url = config['drupal.db_url'] 
 
         self.engine = create_engine(url)
-        self.metadata = MetaData()
+        self.metadata = MetaData(self.engine)
 
         PACKAGE_NAME_MAX_LENGTH = 100
         PACKAGE_VERSION_MAX_LENGTH = 100
@@ -210,5 +268,11 @@ class Drupal(SingletonPlugin):
             Column('value', types.UnicodeText),
         )
 
+        self.node = Table('node', self.metadata,
+                          autoload = True)
+        self.node_revisions = Table('node_revisions', self.metadata,
+                                   autoload = True)
+
         self.metadata.create_all(self.engine)
+
 
