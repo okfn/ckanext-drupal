@@ -1,6 +1,6 @@
 import datetime
 from sqlalchemy import types, Column, Table
-from sqlalchemy.sql import select
+from sqlalchemy.sql import select, and_
 from sqlalchemy import MetaData, create_engine
 import json
 import time
@@ -15,7 +15,7 @@ class Drupal(SingletonPlugin):
     implements(IConfigurer)
     implements(ISession, inherit=True)
 
-    def create_node(self, row, session, conn):
+    def update_node(self, row, session, conn):
 
         timestamp=int(time.time())
 
@@ -24,7 +24,7 @@ class Drupal(SingletonPlugin):
                 nid=0,
                 uid=1,
                 title=row.get('title',''),
-                body=row.get('description',''),
+                body=row.get('notes',''),
                 teaser=row.get('title',''),
                 log='%s-%s'%(session.revision.id,session.revision.message),
                 timestamp=timestamp,
@@ -32,25 +32,40 @@ class Drupal(SingletonPlugin):
             )
         )
         vid = result.inserted_primary_key[0]
-        result = conn.execute(
-            self.node.insert().values(
-                vid=vid,
-                type='package',
-                language='',
-                title=row.get('title',''),
-                uid=1,
-                status=0,
-                created=timestamp,
-                changed=timestamp,
-                comment=2,
-                promote=0,
-                moderate=0,
-                sticky=0,
-                tnid=0,
-                transalate=0,
+        
+
+        if 'nid' in row:
+            result = conn.execute(
+                self.node.update().where(
+                    self.node.c.nid == row['nid']
+                ).values(
+                    vid=vid,
+                    title=row.get('title',''),
+                )
             )
-        )
-        nid = result.inserted_primary_key[0]
+            nid = row['nid']
+        else:
+            result = conn.execute(
+                self.node.insert().values(
+                    vid=vid,
+                    type='package',
+                    language='',
+                    title=row.get('title',''),
+                    uid=1,
+                    status=0,
+                    created=timestamp,
+                    changed=timestamp,
+                    comment=2,
+                    promote=0,
+                    moderate=0,
+                    sticky=0,
+                    tnid=0,
+                    transalate=0,
+                )
+            )
+            nid = result.inserted_primary_key[0]
+            row['nid'] = nid
+
         conn.execute(
             self.node_revisions.update().where(
                 self.node_revisions.c.vid == vid).values(
@@ -58,6 +73,16 @@ class Drupal(SingletonPlugin):
                 )
         )
         return nid
+
+    def get_package_row(self, conn, package_id):
+
+        return conn.execute(
+            select(
+                [self.package_table],
+                self.package_table.c.id == package_id
+            )
+        ).fetchone()
+
             
     def update_drupal(self, session, conn):
 
@@ -72,52 +97,76 @@ class Drupal(SingletonPlugin):
             update_date = datetime.datetime.now()
 
         package_rows = {}
+        package_tags = {}
 
         inserts = []
         updates = []
         deletes = []
 
-        new_nids = []
+        updated_nids = []
 
         for obj in new:
             if hasattr(obj, 'state') and 'pending' in obj.state:
                 continue
+            if hasattr(obj, 'current') and obj.current <> '1':
+                continue
             if isinstance(obj, (model.Package, model.PackageRevision)):
                 insert = self.add_insert(obj, self.package_table)
                 package_rows[insert['id']] = insert
-                nid = self.create_node(insert, session, conn)
-                new_nids.append(nid)
-                insert['nid'] = nid
                 inserts.append(insert)
-
             if isinstance(obj, (model.Resource, model.ResourceRevision)):
                 inserts.append(self.add_insert(obj, self.resource_table))
             if isinstance(obj, (model.PackageExtra, model.PackageExtraRevision)):
                 inserts.append(self.add_insert(obj, self.package_extra_table))
+            if isinstance(obj, (model.PackageTag, model.PackageTagRevision)):
+                inserts.append(self.add_tag(obj, conn))
 
         for obj in changed:
             if hasattr(obj, 'state') and 'pending' in obj.state:
                 continue
+            if hasattr(obj, 'current') and obj.current <> '1':
+                continue
             if isinstance(obj, (model.Package, model.PackageRevision)):
                 update = self.add_update(obj, self.package_table)
-                package_rows[insert['id']] = insert
+                package_row = package_rows.get(
+                    obj.id,
+                    self.get_package_row(conn, obj.id)
+                )
+                
+                update['nid'] = package_row['nid']
+                package_rows[update['id']] = update
                 updates.append(update)
             if isinstance(obj, (model.Resource, model.ResourceRevision)):
-                updates.append(self.add_update(obj, self.resource_table))
+                if obj.state == 'deleted':
+                    deletes.append(self.add_delete(obj, self.resource_table, conn))
+                else:
+                    updates.append(self.add_update(obj, self.resource_table))
             if isinstance(obj, (model.PackageExtra, model.PackageExtraRevision)):
-                updates.append(self.add_update(obj, self.package_extra_table))
+                if obj.state == 'deleted':
+                    deletes.append(self.add_delete(obj, self.package_extra_table, conn))
+                else:
+                    updates.append(self.add_update(obj, self.package_extra_table))
+            if isinstance(obj, (model.PackageTag, model.PackageTagRevision)):
+                if obj.state == 'deleted':
+                    deletes.append(self.remove_tag(obj, conn))
 
         for obj in deleted:
             if hasattr(obj, 'state') and 'pending' in obj.state:
                 continue
+            if hasattr(obj, 'current') and obj.current <> '1':
+                continue
             if isinstance(obj, (model.Package, model.PackageRevision)):
                 delete = self.add_delete(obj, self.package_table)
+                package_row = self.get_package_row(conn, obj.id)
+                delete['nid'] = delete['nid']
                 package_rows[delete['id']] = delete
                 deletes.append(delete)
             if isinstance(obj, (model.PackageExtra, model.PackageExtraRevision)):
                 deletes.append(self.add_delete(obj, self.package_extra_table, conn))
-            if isinstance(obj, (model.Package, model.PackageRevision)):
+            if isinstance(obj, (model.Resource, model.ResourceRevision)):
                 deletes.append(self.add_delete(obj, self.resource_table, conn))
+            if isinstance(obj, (model.PackageTag, model.PackageTagRevision)):
+                deletes.append(self.remove_tag(obj, conn))
 
         for row in inserts + updates + deletes:
             if 'package_id' in row:
@@ -127,11 +176,23 @@ class Drupal(SingletonPlugin):
             if package_id in package_rows:
                 package_rows[package_id]['update_date'] = update_date
             else:
+                package_row = self.get_package_row(conn, package_id)
                 update = {'__table': self.package_table, 
                           'id': package_id,
-                          'update_date': update_date}
+                          'nid': package_row['nid'],
+                          'update_date': update_date,
+                          'title': package_row['title'],
+                          'notes': package_row['notes']}
                 updates.append(update)
-                package_rows['package_id'] = update
+                package_rows[package_id] = update
+
+        for package_row in package_rows.values():
+            nid = self.update_node(package_row, session, conn)
+            updated_nids.append(nid)
+
+        for row in inserts + updates + deletes:
+            if 'package_id' in row:
+                row['nid'] = package_rows[row['package_id']]['nid']
 
         for row in inserts:
            table = row.pop('__table') 
@@ -142,13 +203,18 @@ class Drupal(SingletonPlugin):
            id = row.pop('id')
            conn.execute(table.update().where(table.c.id==id).values(**row))
 
-        for nid in new_nids:
-            conn.execute(
-                self.node.update().where(
-                    self.node.c.nid == nid).values(
-                        status=1,
-                    )
-            )
+        for row in deletes:
+           table = row.pop('__table') 
+           if table == self.term_node:
+               conn.execute(
+                   table.delete().where(
+                       and_(table.c.nid==row['nid'],table.c.tid==row['tid'])
+                   )
+               )
+               continue
+           id = row.pop('id')
+           conn.execute(table.delete().where(table.c.id==id))
+
 
     def add_insert(self, obj, table):
 
@@ -173,7 +239,7 @@ class Drupal(SingletonPlugin):
             if value is not None:
                 update[column.name] = value
         if isinstance(obj, model.Resource):
-            update['package_id'] = obj.resouce_group.package_id
+            update['package_id'] = obj.resource_group.package_id
             update['extras'] = json.dumps(update['extras'])
         if isinstance(obj, model.ResourceRevision):
             update['package_id'] = obj.continuity.resource_group.package_id
@@ -196,6 +262,54 @@ class Drupal(SingletonPlugin):
             ).fetchone()["package_id"]
             delete["package_id"] = package_id
         return delete
+
+    def add_tag(self, obj, conn):
+
+        term = conn.execute(
+            select([self.term_data]).where(
+                and_(
+                    self.term_data.c.vid == self.vid,
+                    self.term_data.c.name == obj.tag.name
+                )
+            )
+        ).fetchone()
+
+        if not term:
+            insert_term = conn.execute(
+                self.term_data.insert().values(
+                    vid=self.vid,
+                    name=obj.tag.name
+                )
+            )
+            tid = insert_term.inserted_primary_key[0]
+        else:
+            tid = term['tid']
+
+        return {
+            '__table': self.term_node,
+            'package_id': obj.package_id,
+            'tid': tid,
+            'vid': self.vid
+        }
+
+    def remove_tag(self, obj, conn):
+
+        tid = conn.execute(
+            select([self.term_data]).where(
+                and_(
+                    self.term_data.c.vid == self.vid,
+                    self.term_data.c.name == obj.tag.name
+                )
+            )
+        ).fetchone()['tid']
+
+        return {
+            '__table': self.term_node,
+            'package_id': obj.package_id,
+            'tid': tid,
+            'vid': self.vid
+        }
+
 
     def before_commit(self, session):
 
@@ -220,8 +334,9 @@ class Drupal(SingletonPlugin):
         config['ckan.site_title'] = 'CKAN-Drupal'
 
         url = config['drupal.db_url'] 
+        self.vid = int(config.get('drupal.vid', 1))
 
-        self.engine = create_engine(url)
+        self.engine = create_engine(url, echo=True)
         self.metadata = MetaData(self.engine)
 
         PACKAGE_NAME_MAX_LENGTH = 100
@@ -242,10 +357,13 @@ class Drupal(SingletonPlugin):
             Column('notes', types.UnicodeText),
             Column('license_id', types.UnicodeText),
             Column('update_date', types.DateTime),
+            Column('state', types.UnicodeText),
+            Column('completed', types.Boolean),
         )
 
         self.resource_table = Table(
             'ckan_resource', self.metadata,
+            Column('nid', types.Integer),
             ## cache of package id to make things easier
             Column('package_id', types.UnicodeText),
             ##
@@ -261,8 +379,8 @@ class Drupal(SingletonPlugin):
             )
 
         self.package_extra_table = Table('ckan_package_extra', self.metadata,
+            Column('nid', types.Integer),
             Column('id', types.Unicode(100), primary_key=True),
-            # NB: only (package, key) pair is unique
             Column('package_id', types.UnicodeText),
             Column('key', types.UnicodeText),
             Column('value', types.UnicodeText),
@@ -272,7 +390,10 @@ class Drupal(SingletonPlugin):
                           autoload = True)
         self.node_revisions = Table('node_revisions', self.metadata,
                                    autoload = True)
+        self.term_node = Table('term_node', self.metadata,
+                                   autoload = True)
+        self.term_data = Table('term_data', self.metadata,
+                                   autoload = True)
 
         self.metadata.create_all(self.engine)
-
 
